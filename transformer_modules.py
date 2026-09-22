@@ -156,3 +156,89 @@ class TransformerEncoder(nn.Module):
         for blk in self.blks:
             X = blk(X, valid_lens)
         return X
+
+
+# ==================== 7. 解码器块与解码器大楼 ====================
+class DecoderBlock(nn.Module):
+    """Transformer 解码器单层块"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
+                 dropout, i, bias=False):
+        super().__init__()
+        self.i = i
+        # 1. 掩蔽自注意力（防止偷看未来的词）
+        self.attention1 = MultiHeadAttention(key_size, query_size, value_size,
+                                             num_hiddens, num_heads, dropout, bias)
+        self.addnorm1 = AddNorm(norm_shape, dropout)
+        # 2. 跨注意力（用自己的 Q 去查编码器的 K, V）
+        self.attention2 = MultiHeadAttention(key_size, query_size, value_size,
+                                             num_hiddens, num_heads, dropout, bias)
+        self.addnorm2 = AddNorm(norm_shape, dropout)
+        # 3. 前馈全连接网络
+        self.ffn = PositionWiseFFN(ffn_num_input, ffn_num_hiddens, num_hiddens)
+        self.addnorm3 = AddNorm(norm_shape, dropout)
+
+    def forward(self, X, state):
+        enc_outputs, enc_valid_lens = state[0], state[1]
+        
+        # 训练时防偷看掩码：构造下三角掩码
+        if self.training:
+            batch_size, num_steps, _ = X.shape
+            # dec_valid_lens 形状: [batch_size, num_steps]，每一步只能看 1, 2, ..., num_steps
+            dec_valid_lens = torch.arange(1, num_steps + 1, device=X.device).repeat(batch_size, 1)
+        else:
+            dec_valid_lens = None
+
+        # 子层 1：掩蔽自注意力 + AddNorm
+        X2 = self.attention1(X, X, X, dec_valid_lens)
+        Y = self.addnorm1(X, X2)
+        
+        # 子层 2：跨注意力（Q=Y, K=enc_outputs, V=enc_outputs）+ AddNorm
+        Y2 = self.attention2(Y, enc_outputs, enc_outputs, enc_valid_lens)
+        Z = self.addnorm2(Y, Y2)
+        
+        # 子层 3：前馈网络 + AddNorm
+        return self.addnorm3(Z, self.ffn(Z)), state
+
+
+class TransformerDecoder(nn.Module):
+    """Transformer 完整解码器大楼"""
+    def __init__(self, vocab_size, key_size, query_size, value_size,
+                 num_hiddens, norm_shape, ffn_num_input, ffn_num_hiddens,
+                 num_heads, num_layers, dropout, bias=False):
+        super().__init__()
+        self.num_hiddens = num_hiddens
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blks = nn.Sequential()
+        for i in range(num_layers):
+            self.blks.add_module("block" + str(i),
+                DecoderBlock(key_size, query_size, value_size, num_hiddens,
+                             norm_shape, ffn_num_input, ffn_num_hiddens,
+                             num_heads, dropout, i, bias))
+        # 最终输出头：将 num_hiddens 映射到词表大小 vocab_size 预测概率
+        self.dense = nn.Linear(num_hiddens, vocab_size)
+
+    def init_state(self, enc_outputs, enc_valid_lens):
+        return [enc_outputs, enc_valid_lens]
+
+    def forward(self, X, state):
+        X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        for blk in self.blks:
+            X, state = blk(X, state)
+        return self.dense(X), state
+
+
+# ==================== 8. Transformer 完整组装 ====================
+class TransformerModel(nn.Module):
+    """完整的 Transformer 端到端大模型"""
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, enc_X, dec_X, enc_valid_lens):
+        enc_outputs = self.encoder(enc_X, enc_valid_lens)
+        dec_state = self.decoder.init_state(enc_outputs, enc_valid_lens)
+        return self.decoder(dec_X, dec_state)[0]
